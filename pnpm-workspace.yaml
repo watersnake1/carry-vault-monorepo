@@ -1,0 +1,7 @@
+packages:
+  - "contracts"
+  - "keeper"
+  - "frontend"
+  - "indexer"
+  - "backtest"
+  - "shared"
