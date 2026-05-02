@@ -1,0 +1,27 @@
+type Vault @entity(immutable: false) {
+ id: ID!
+ totalAssets: BigInt!
+ totalShares: BigInt!
+ insurancePoolBalance: BigInt!
+ lastUpdate: BigInt!
+}
+type Position @entity(immutable: false) {
+ id: ID! # user address
+ user: Bytes!
+ hypeDeposit: BigInt!
+ hypeLegDirection: Int!
+ riskProfile: Int!
+ usdcDebt: BigInt!
+ smoothingReserveBalance: BigInt!
+ state: Int!
+ openedAt: BigInt!
+}
+type CascadeEvent @entity(immutable: true) {
+ id: ID! # tx hash + log index
+ user: Bytes!
+ stage: String! # "A" | "B" | "C"
+ ltvBefore: BigInt!
+ ltvAfter: BigInt!
+ blockNumber: BigInt!
+ timestamp: BigInt!
+}

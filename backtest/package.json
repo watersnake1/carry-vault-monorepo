@@ -1,0 +1,28 @@
+{
+  "name": "@carry-vault/backtest",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "main": "./dist/runners/parameterSweep.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "tsx src/runners/parameterSweep.ts",
+    "test":  "vitest run",
+    "lint":  "eslint src",
+    "sweep": "tsx src/runners/parameterSweep.ts"
+  },
+  "dependencies": {
+    "@carry-vault/shared": "workspace:*",
+    "arquero": "^7.0.0",
+    "simple-statistics": "^7.8.3",
+    "commander": "^12.0.0",
+    "csv-parse": "^5.5.0",
+    "csv-stringify": "^6.4.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "tsx": "^4.7.0",
+    "vitest": "^1.6.0",
+    "@types/node": "^20.0.0"
+  }
+}

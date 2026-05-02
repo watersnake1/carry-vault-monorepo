@@ -1,0 +1,31 @@
+{
+ "name": "@carry-vault/keeper",
+ "version": "0.0.1",
+ "private": true,
+ "type": "module",
+ "main": "./dist/index.js",
+ "scripts": {
+ "build": "tsc -p tsconfig.json",
+ "start": "node ./dist/index.js",
+ "dev": "tsx watch src/index.ts",
+ "test": "vitest run",
+ "lint": "eslint src"
+ },
+ "dependencies": {
+ "@carry-vault/shared": "workspace:*",
+ "viem": "^2.0.0",
+ "node-cron": "^3.0.3",
+ "pino": "^9.0.0",
+ "prom-client": "^15.0.0",
+ "@sentry/node": "^8.0.0",
+ "zod": "^3.22.0",
+ "dotenv": "^16.4.0"
+ },
+ "devDependencies": {
+ "typescript": "^5.4.0",
+ "tsx": "^4.7.0",
+ "vitest": "^1.6.0",
+ "@types/node": "^20.0.0",
+ "@types/node-cron": "^3.0.0"
+ }
+}
