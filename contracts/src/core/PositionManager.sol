@@ -38,7 +38,12 @@ contract PositionManager {
         hyperCoreAdapter = _hyperCore;
         hyperSwapAdapter = _hyperSwap;
     }
-
+    
+    function openSentimentAndBorrow(address /*user*/) external returns (uint256 usdcBorrowed) {
+        // TODO: open Sentiment account, register perp position as collateral,
+        //       borrow USDC at target LTV, transfer USDC to user.
+        return 0;
+    }
     // TODO: openPerpPosition(user, marketId, side, marginUsd, leverage)
     // TODO: closePerpPosition(user, idx) — by index in fundingLeg array
     // TODO: supplyToHyperLend(user, amount), borrowFromHyperLend(user, amount)
