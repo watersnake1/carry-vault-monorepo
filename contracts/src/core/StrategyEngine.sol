@@ -3,34 +3,27 @@ pragma solidity ^0.8.20;
 
 import { AccessControl }   from "@openzeppelin/contracts/access/AccessControl.sol";
 import { ReentrancyGuard } from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import { VaultCore }       from "./VaultCore.sol";
 
 /// @title  StrategyEngine
-/// @notice Two sub-strategies: a fixed HYPE perp leg (set at deposit, locked for
-///         the life of the loan) and a dynamic funding-rate scout that rotates
-///         across non-HYPE HyperCore markets selected by risk-adjusted carry.
-/// @dev    See Technical Spec §2.2, §3.1 (scout), §3.2 (rebalance trigger),
-///         and Risk Framework §3.1–3.3 (entry/exit conditions).
+/// @notice V1: manages a single configured perp market on HyperCore (default WTI/USDC).
+///         V2: adds the multi-pair scout (rank/select/rotate across the whitelist).
+/// @dev    Aligned to Strategy Overview v0.3 and Technical Spec v0.3 (Option C).
+///         See Technical Spec §2.2, §3.1 (scout, V2), §3.3 (cascade callbacks).
 contract StrategyEngine is AccessControl, ReentrancyGuard {
 
-    /* ─────────────────────────────────────────────────────────────────────
-       Enums
-       ─────────────────────────────────────────────────────────────────── */
+    /* ─────────────────────────── Enums ─────────────────────────── */
 
-    /// @dev Side of the perp position relative to the underlying.
+    /// @dev Side of a perp position relative to the underlying.
     enum PerpSide { LONG, SHORT }
 
-    /// @dev Whitelist tier for the funding-leg scout.
-    ///      TIER_1 = deep, established HyperCore-native pairs (BTC, ETH, SOL, ...).
-    ///      TIER_2 = whitelisted HIP-3 markets with sustained liquidity.
+    /// @dev Whitelist tier. TIER_1 = native HyperCore deep markets.
+    ///      TIER_2 = HIP-3 markets with sustained liquidity.
     enum MarketTier { EXCLUDED, TIER_1, TIER_2 }
 
-    /// @dev Asset class drives vol-ceiling lookup at entry (Risk Framework §3.2).
+    /// @dev Drives vol-ceiling lookup and depth multipliers (Risk Framework §3.2).
     enum AssetClass { CRYPTO, EQUITY, COMMODITY, FX }
 
-    /* ─────────────────────────────────────────────────────────────────────
-       Structs
-       ─────────────────────────────────────────────────────────────────── */
+    /* ─────────────────────────── Structs ─────────────────────────── */
 
     /// @notice Whitelisted market metadata.
     struct MarketEntry {
@@ -42,17 +35,15 @@ contract StrategyEngine is AccessControl, ReentrancyGuard {
         bool        active;
     }
 
-    /// @notice One slot in the scout's current target portfolio. All users'
-    ///         funding-leg margin is split across this portfolio proportionally.
+    /// @notice One slot in the V2 scout's target portfolio. Reserved for future use.
     struct PortfolioPosition {
         bytes32   marketId;
         PerpSide  side;
-        uint16    weightBps;        // share of funding-leg notional (sums to 10000)
+        uint16    weightBps;        // share of funding-leg notional (sum to 10000)
         uint64    enteredAt;
     }
 
-    /// @notice Tracks how long a challenger market has been beating the current
-    ///         portfolio's worst slot. See Technical Spec §3.1.1.
+    /// @notice V2 hysteresis tracking. Reserved for future use.
     struct HysteresisState {
         bytes32   challengerMarket;
         PerpSide  challengerSide;
@@ -60,118 +51,67 @@ contract StrategyEngine is AccessControl, ReentrancyGuard {
         uint64    challengeStartedAt;
     }
 
-    /* ─────────────────────────────────────────────────────────────────────
-       Constants — entry conditions and risk caps
-       Numeric values are first-pass; final values come from backtest
-       calibration (Risk Framework §9 open items).
-       ─────────────────────────────────────────────────────────────────── */
+    /* ─────────────────────────── Constants ─────────────────────────── */
 
-    // Hysteresis (Technical Spec §3.1.1)
-    uint16 public constant HYSTERESIS_SCORE_ADVANTAGE_BPS = 2500;   // 25% advantage required
+    // V2 scout parameters (Risk Framework §3.2, §3.1.1). Defined now so the
+    // data model is stable; consumed by V2 scout logic in subsequent commits.
+    uint16 public constant HYSTERESIS_SCORE_ADVANTAGE_BPS = 2500;
     uint64 public constant HYSTERESIS_TIME_WINDOW_SEC     = 4 hours;
     uint64 public constant FUNDING_SIGN_PERSISTENCE_SEC   = 8 hours;
     uint64 public constant COOLDOWN_AFTER_STRESS_SEC      = 24 hours;
-    uint64 public constant MAX_HOLDING_PERIOD_SEC         = 7 days;  // force re-eval
-
-    // Net carry threshold (Risk Framework §3.2)
-    uint16 public constant MIN_NET_CARRY_BPS              = 300;     // 3% APR after costs
-
-    // OI bands (Risk Framework §3.1)
-    uint16 public constant MIN_OI_PCT_BPS                 = 100;     // 1% of market OI
-    uint16 public constant MAX_OI_PCT_TIER1_BPS           = 500;     // 5% for native HyperCore
-    uint16 public constant MAX_OI_PCT_TIER2_BPS           = 300;     // 3% for HIP-3
-
-    // Vol ceilings at entry (Risk Framework §3.2)
-    uint16 public constant VOL_CEILING_CRYPTO_BPS         = 15000;   // 150% annualized
-    uint16 public constant VOL_CEILING_EQUITY_BPS         = 6000;    // 60%
-    uint16 public constant VOL_CEILING_COMMODITY_BPS      = 8000;    // 80%
-    uint16 public constant VOL_CEILING_FX_BPS             = 2500;    // 25%
-
-    // HIP-3 specific
-    uint16 public constant DEPTH_FACTOR_HIP3_BPS          = 15000;   // 1.5x slippage multiplier
-    uint64 public constant HIP3_MIN_AGE_SEC               = 30 days; // age-in requirement
-
-    // Per-profile caps (Risk Framework §2)
-    uint8  public constant MAX_CONCURRENT_POSITIONS_CONSERVATIVE        = 2;
-    uint8  public constant MAX_CONCURRENT_POSITIONS_RISKY               = 4;
-    uint16 public constant SINGLE_PAIR_CONCENTRATION_CONSERVATIVE_BPS   = 4000;  // 40%
-    uint16 public constant SINGLE_PAIR_CONCENTRATION_RISKY_BPS          = 6000;  // 60%
-    uint16 public constant PER_DEPLOYER_CAP_CONSERVATIVE_BPS            = 2500;  // 25%
-    uint16 public constant PER_DEPLOYER_CAP_RISKY_BPS                   = 4000;  // 40%
-
+    uint64 public constant MAX_HOLDING_PERIOD_SEC         = 7 days;
+    uint16 public constant MIN_NET_CARRY_BPS              = 300;     // 3% APR
+    uint16 public constant MIN_OI_PCT_BPS                 = 100;     // 1%
+    uint16 public constant MAX_OI_PCT_TIER1_BPS           = 500;     // 5%
+    uint16 public constant MAX_OI_PCT_TIER2_BPS           = 300;     // 3%
+    uint16 public constant VOL_CEILING_CRYPTO_BPS         = 15000;
+    uint16 public constant VOL_CEILING_EQUITY_BPS         = 6000;
+    uint16 public constant VOL_CEILING_COMMODITY_BPS      = 8000;
+    uint16 public constant VOL_CEILING_FX_BPS             = 2500;
+    uint64 public constant HIP3_MIN_AGE_SEC               = 30 days;
     uint16 public constant BPS_DENOM                      = 10000;
 
-    /* ─────────────────────────────────────────────────────────────────────
-       Immutable peer-contract references
-       Auth for inter-contract calls is by address comparison rather than
-       AccessControl roles — cheaper and clearer for one-to-one trust.
-       ─────────────────────────────────────────────────────────────────── */
-
+    /* ─────────── Immutable peer refs ─────────── */
     address public immutable vaultCore;
     address public immutable positionManager;
     address public immutable oracleLayer;
     address public immutable riskManager;
 
-    /* ─────────────────────────────────────────────────────────────────────
-       Storage — whitelist
-       ─────────────────────────────────────────────────────────────────── */
+    /* ─────────────────────────── Storage ─────────────────────────── */
 
-    /// @notice Whitelisted market IDs the scout can rotate into. Iterable via
-    ///         length getter; entries indexed by `marketEntries[id]`.
+    /// @notice The perp market the vault opens at deposit. V1 admin-settable
+    ///         (single market for all users). V2 will have the scout select
+    ///         from the whitelist instead of using a configured value.
+    bytes32 public configuredPerpMarket;
+
+    /// @notice Whitelist of markets the V2 scout may select from. For V1 the
+    ///         configured market may but does not have to appear in this list.
     bytes32[] public whitelistedMarketIds;
-
-    /// @notice Per-market metadata.
     mapping(bytes32 => MarketEntry) public marketEntries;
+    mapping(bytes32 => bool)        public excludedBaseAssets;  // key = keccak256(symbol)
 
-    /// @notice Base assets the funding leg is forbidden from entering. HYPE
-    ///         is added in the constructor; admin can extend the set.
-    /// @dev    Key is keccak256(bytes(symbol)) e.g. keccak256("HYPE").
-    mapping(bytes32 => bool) public excludedBaseAssets;
-
-    /* ─────────────────────────────────────────────────────────────────────
-       Storage — scout state
-       ─────────────────────────────────────────────────────────────────── */
-
-    /// @notice Current scout-selected target portfolio. All active users'
-    ///         funding-leg margin is allocated across this portfolio. A single
-    ///         shared portfolio rather than per-user is the V1/V2 simplification;
-    ///         per-user portfolios are V3 work (Sharpe-weighted sizing).
+    /// @notice V2 scout state. Populated by evaluateFundingLeg() in subsequent commits.
     PortfolioPosition[] public currentPortfolio;
-
-    /// @notice Last time the scout evaluated and updated currentPortfolio.
     uint64 public lastScoutEvaluationAt;
-
-    /// @notice Hysteresis tracking for the next-best rotation candidate.
     HysteresisState public hysteresis;
 
-    /* ─────────────────────────────────────────────────────────────────────
-       Storage — caps and cooldowns
-       ─────────────────────────────────────────────────────────────────── */
-
-    /// @notice Total notional currently allocated to each HIP-3 deployer
-    ///         across the entire vault. Used to enforce per-deployer caps
-    ///         on portfolio rotations.
+    /// @notice Total notional currently allocated across HIP-3 deployers.
+    ///         Updated by PositionManager via calls reserved for V2.
     mapping(address => uint256) public deployerNotionalUsd;
 
-    /// @notice Per-user post-stress lockout. While `block.timestamp 
-    ///         userCooldownUntil[user]`, the user's funding leg stays flat.
+    /// @notice Per-user post-stress lockout. Set by RiskManager during cascade.
     mapping(address => uint64) public userCooldownUntil;
 
-    /* ─────────────────────────────────────────────────────────────────────
-       Events
-       ─────────────────────────────────────────────────────────────────── */
+    /* ─────────────────────────── Events ─────────────────────────── */
 
-    // Lifecycle (HYPE leg is opened/managed via PositionManager; these events
-    // fire when StrategyEngine *decides* an action, before delegation.)
-    event HypeLegOpenTriggered(
-        address indexed user,
-        VaultCore.HypeLegDirection direction,
-        uint256 marginUsd,
-        uint16  leverageBps
-    );
-    event HypeLegReduceTriggered(address indexed user, uint16 percentBps);
+    // Configured market
+    event ConfiguredPerpMarketChanged(bytes32 indexed previousMarketId, bytes32 indexed newMarketId);
 
-    // Scout
+    // Cascade callbacks (perp-leg lifecycle, called by RiskManager)
+    event PerpLegReduceTriggered(address indexed user, uint16 percentBps);
+    event PerpLegCloseTriggered(address indexed user);
+
+    // Scout (V2)
     event FundingLegEvaluated(uint64 timestamp, uint256 candidatesEvaluated);
     event PortfolioRotated(bytes32[] removedMarkets, bytes32[] addedMarkets);
     event HysteresisChallengerSet(bytes32 indexed marketId, PerpSide side, uint256 score);
@@ -186,11 +126,10 @@ contract StrategyEngine is AccessControl, ReentrancyGuard {
     event UserCooldownSet(address indexed user, uint64 until);
     event DeployerNotionalUpdated(address indexed deployer, uint256 notional);
 
-    /* ─────────────────────────────────────────────────────────────────────
-       Custom errors
-       ─────────────────────────────────────────────────────────────────── */
+    /* ─────────────────────────── Errors ─────────────────────────── */
 
     error ZeroAddress();
+    error ZeroBytes32();
     error UnauthorizedCaller(address caller);
 
     error MarketNotWhitelisted(bytes32 marketId);
@@ -210,15 +149,8 @@ contract StrategyEngine is AccessControl, ReentrancyGuard {
     error HysteresisChallengerStale(uint64 challengerStartedAt, uint64 nowTs);
     error CooldownActive(address user, uint64 until);
 
-    /* ─────────────────────────────────────────────────────────────────────
-       Constructor
-       ─────────────────────────────────────────────────────────────────── */
+    /* ─────────────────────────── Constructor ─────────────────────────── */
 
-    /// @param _vaultCore       VaultCore contract address.
-    /// @param _positionManager PositionManager contract address.
-    /// @param _oracleLayer     OracleLayer contract address.
-    /// @param _riskManager     RiskManager contract address.
-    /// @param admin            Multisig holding DEFAULT_ADMIN_ROLE for whitelist mgmt.
     constructor(
         address _vaultCore,
         address _positionManager,
@@ -239,16 +171,17 @@ contract StrategyEngine is AccessControl, ReentrancyGuard {
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
 
-        // HYPE always excluded from the funding leg (Strategy Overview v0.2,
-        // and confirmed in Risk Framework §1.2).
+        // V1 default: WTI/USDC. Admin can change via setConfiguredPerpMarket.
+        configuredPerpMarket = keccak256("WTI-USDC");
+
+        // HYPE always excluded from any perp leg the strategy may take
+        // (Strategy Overview v0.3 — perp leg is non-HYPE only).
         bytes32 hypeAssetHash = keccak256(bytes("HYPE"));
         excludedBaseAssets[hypeAssetHash] = true;
         emit BaseAssetExclusionSet(hypeAssetHash, true);
     }
 
-    /* ─────────────────────────────────────────────────────────────────────
-       Modifiers
-       ─────────────────────────────────────────────────────────────────── */
+    /* ─────────────────────────── Modifiers ─────────────────────────── */
 
     modifier onlyVaultCore() {
         if (msg.sender != vaultCore) revert UnauthorizedCaller(msg.sender);
@@ -260,57 +193,123 @@ contract StrategyEngine is AccessControl, ReentrancyGuard {
         _;
     }
 
-    // functions start here
-    function openHypeLeg(address /*user*/, uint8 /*direction*/, uint256 /*marginHype*/, uint16 /*leverageBps*/) external onlyVaultCore {
-    // TODO: validate against RiskManager, instruct PositionManager. See Spec §3.
+    /* ─────────────────────────── V1 entry points ─────────────────────────── */
+
+    /// @notice The perp market opened at deposit. Read by VaultCore.depositWithProfile.
+    function currentPerpMarket() external view returns (bytes32) {
+        return configuredPerpMarket;
     }
 
-    function activateUserFundingLeg(address /*user*/, uint256 /*marginHype*/) external onlyVaultCore {
-    // TODO: allocate user's funding margin across currentPortfolio.
+    /* ─────────────────────────── Admin ─────────────────────────── */
+
+    /// @notice Change the configured V1 perp market. Should only be invoked
+    ///         when there are no active positions, or all active positions are
+    ///         on the new market — VaultCore does not migrate existing
+    ///         positions when this changes.
+    function setConfiguredPerpMarket(bytes32 newMarketId)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        if (newMarketId == bytes32(0)) revert ZeroBytes32();
+        bytes32 previous = configuredPerpMarket;
+        configuredPerpMarket = newMarketId;
+        emit ConfiguredPerpMarketChanged(previous, newMarketId);
+    }
+
+    /// @notice Add a market to the V2 scout whitelist.
+    function whitelistMarket(
+        bytes32     marketId,
+        MarketTier  tier,
+        AssetClass  assetClass,
+        address     deployer
+    )
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        if (marketId == bytes32(0))                           revert ZeroBytes32();
+        if (marketEntries[marketId].active)                   revert MarketAlreadyWhitelisted(marketId);
+
+        marketEntries[marketId] = MarketEntry({
+            marketId:      marketId,
+            tier:          tier,
+            assetClass:    assetClass,
+            deployer:      deployer,
+            whitelistedAt: uint64(block.timestamp),
+            active:        true
+        });
+        whitelistedMarketIds.push(marketId);
+
+        emit MarketWhitelisted(marketId, tier, assetClass, deployer);
+    }
+
+    /// @notice Remove a market from the V2 scout whitelist. The market entry
+    ///         is preserved (with active = false) so historical references
+    ///         remain valid.
+    function unwhitelistMarket(bytes32 marketId)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        MarketEntry storage entry = marketEntries[marketId];
+        if (!entry.active) revert MarketNotWhitelisted(marketId);
+
+        entry.active = false;
+
+        // Compact whitelistedMarketIds array
+        uint256 len = whitelistedMarketIds.length;
+        for (uint256 i = 0; i < len; i++) {
+            if (whitelistedMarketIds[i] == marketId) {
+                if (i != len - 1) {
+                    whitelistedMarketIds[i] = whitelistedMarketIds[len - 1];
+                }
+                whitelistedMarketIds.pop();
+                break;
+            }
+        }
+
+        emit MarketUnwhitelisted(marketId);
+    }
+
+    /// @notice Toggle exclusion of a base asset from any perp leg the strategy
+    ///         may take. HYPE is excluded by default in the constructor.
+    function setExcludedBaseAsset(bytes32 baseAssetHash, bool excluded)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+    {
+        if (baseAssetHash == bytes32(0)) revert ZeroBytes32();
+        excludedBaseAssets[baseAssetHash] = excluded;
+        emit BaseAssetExclusionSet(baseAssetHash, excluded);
+    }
+
+    /* ─────────────────────────── Views ─────────────────────────── */
+
+    function getWhitelistLength() external view returns (uint256) {
+        return whitelistedMarketIds.length;
+    }
+
+    function isMarketWhitelisted(bytes32 marketId) external view returns (bool) {
+        return marketEntries[marketId].active;
+    }
+
+    function getMarketEntry(bytes32 marketId) external view returns (MarketEntry memory) {
+        return marketEntries[marketId];
     }
 
     /* ─────────────────────────────────────────────────────────────────────
        Function stubs — implementations come in subsequent commits.
        ───────────────────────────────────────────────────────────────────
 
-       Called by VaultCore at deposit:
-         function openHypeLeg(
-             address user,
-             VaultCore.HypeLegDirection direction,
-             uint256 marginUsd,
-             uint16  leverageBps
-         ) external onlyVaultCore;
-
-       Called by VaultCore.rebalance() (keeper-driven):
-         function evaluateFundingLeg() external returns (PortfolioPosition[] memory);
-
-       Called by RiskManager during cascade:
-         function closeFundingLeg(address user) external onlyRiskManager;        // Stage A
-         function reduceHypeLeg(address user, uint256 percentBps) external onlyRiskManager;  // Stage B
-
-       Called by RiskManager after stress events:
+       Cascade callbacks (called by RiskManager during stress):
+         function reducePerpLeg(address user, uint16 percentBps) external onlyRiskManager;
+         function closePerpLegFull(address user) external onlyRiskManager;
          function setUserCooldown(address user, uint64 until) external onlyRiskManager;
 
-       Admin (DEFAULT_ADMIN_ROLE):
-         function whitelistMarket(
-             bytes32     marketId,
-             MarketTier  tier,
-             AssetClass  class,
-             address     deployer
-         ) external;
-         function unwhitelistMarket(bytes32 marketId) external;
-         function setExcludedBaseAsset(bytes32 baseAssetHash, bool excluded) external;
-         function triggerScoutEvaluation() external;     // emergency manual trigger
-
-       Internal (helpers):
-         function _rankCandidateMarkets(...) internal returns (...);              // Spec §3.1
+       V2 scout (called by KeeperBot via VaultCore.rebalance()):
+         function evaluatePerpRotation() external returns (bytes32 newMarketId);
+         function _rankCandidateMarkets(...) internal returns (...);
          function _respectsHysteresis(bytes32 challenger, uint256 score) internal view returns (bool);
          function _computeNetCarryBps(bytes32 marketId, uint256 positionUsd) internal view returns (int256);
-         function _isCooldownActive(address user) internal view returns (bool);
 
-       Views:
-         function getCurrentPortfolio() external view returns (PortfolioPosition[] memory);
-         function getWhitelistLength() external view returns (uint256);
-         function getMarketEntry(bytes32 marketId) external view returns (MarketEntry memory);
+       Helpers:
+         function _isCooldownActive(address user) internal view returns (bool);
        ─────────────────────────────────────────────────────────────── */
 }

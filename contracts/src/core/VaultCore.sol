@@ -11,31 +11,41 @@ import { ReentrancyGuard }  from "@openzeppelin/contracts/utils/ReentrancyGuard.
 
 /* ─────────────────────────────────────────────────────────────────────────
    Minimal peer-contract interfaces
-   Using uint8 for enum boundaries to keep these decoupled from VaultCore's
-   own enum definitions and avoid circular imports.
    ──────────────────────────────────────────────────────────────────────── */
 
 interface IStrategyEngineMin {
-    function openHypeLeg(address user, uint8 direction, uint256 marginHype, uint16 leverageBps) external;
-    function activateUserFundingLeg(address user, uint256 marginHype) external;
+    function currentPerpMarket() external view returns (bytes32 marketId);
 }
 
 interface IPositionManagerMin {
-    function openSentimentAndBorrow(address user) external returns (uint256 usdcBorrowed);
+    function supplyToHyperLendAndBorrow(
+        address user,
+        uint256 hypeAmount,
+        uint16  targetLtvBps
+    ) external returns (uint256 usdcBorrowed);
+
+    function openPerpLegAndExtractMargin(
+        address user,
+        bytes32 marketId,
+        uint256 hypeAmount,
+        uint16  leverageBps
+    ) external returns (uint256 marginWithdrawnUsd);
 }
 
 interface IRiskManagerMin {
-    function getHypeLegLeverageForProfile(uint8 profile) external view returns (uint16 leverageBps);
+    function getPerpLeverageForProfile(uint8 profile) external view returns (uint16 leverageBps);
+    function getReserveSplitForProfile(uint8 profile) external view returns (uint16 reserveBps);
+    function getHyperLendTargetLtv(uint8 profile)    external view returns (uint16 ltvBps);
 }
 
 /// @title  VaultCore
 /// @notice ERC-4626 share accounting, NAV, deposit/withdraw flows, per-user
 ///         position state, and the vault-level lifecycle state machine.
+/// @dev    Aligned to Strategy Overview v0.3 and Risk Framework v0.3 (Option C).
 contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    /* ─────────────────────────── Roles ─────────────────────────── */
-
+    /* ─── Roles ─── */
     bytes32 public constant KEEPER_ROLE        = keccak256("KEEPER_ROLE");
     bytes32 public constant RISK_MANAGER_ROLE  = keccak256("RISK_MANAGER_ROLE");
     bytes32 public constant STRATEGY_ROLE      = keccak256("STRATEGY_ROLE");
@@ -43,27 +53,31 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
     bytes32 public constant PAUSER_ROLE        = keccak256("PAUSER_ROLE");
     bytes32 public constant TREASURY_ROLE      = keccak256("TREASURY_ROLE");
 
-    /* ─────────────────────────── Enums ─────────────────────────── */
+    /* ─── Enums ─── */
+    enum VaultLevelState { NORMAL, STRESS, EMERGENCY, WINDDOWN }
+    enum LifecycleState  { NONE, OPEN, REPAYING, CLOSED, FORCE_CLOSED }
+    enum RiskProfile     { CONSERVATIVE, RISKY }
 
-    enum VaultLevelState  { NORMAL, STRESS, EMERGENCY, WINDDOWN }
-    enum LifecycleState   { NONE, OPEN, REPAYING, CLOSED, FORCE_CLOSED }
-    enum HypeLegDirection { NONE, LONG, SHORT }
-    enum RiskProfile      { CONSERVATIVE, RISKY }
-
-    /* ─────────────────────────── Structs ─────────────────────────── */
-
+    /* ─── Structs ─── */
     struct UserPosition {
         address user;
         uint64  openedAt;
+
+        // user-chosen dials (locked at deposit)
         uint256 hypeDeposit;
-        HypeLegDirection hypeLegDirection;
-        uint16  hypeLegLeverageBps;
-        uint16  allocationSplitBps;
+        uint16  allocationSplitBps;     // % of deployable HYPE to lending leg
+        uint16  reserveSplitBps;        // % of total deposit held as spot reserve (profile-driven)
         RiskProfile riskProfile;
         uint32  termPreferenceMonths;
-        uint256 usdcDebt;
-        uint256 smoothingReserveBalance;
-        uint256 creditBalance;
+        bytes32 perpMarketId;           // V1: hardcoded; V2: scout-selected at deposit
+
+        // accounting (mutates over loan life)
+        uint256 hyperLendDebtUsd;        // outstanding USDC debt on HyperLend
+        uint256 perpMarginWithdrawnUsd;  // USDC pulled from HyperCore perp account
+        uint256 spotReserveBalance;      // HYPE held in vault for cascade Stage A (in wei)
+        uint256 smoothingReserveBalance; // USDC accrued for borrow-cost coverage
+        uint256 creditBalance;           // overage from full paydown
+
         LifecycleState state;
     }
 
@@ -84,9 +98,8 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         bool    depositsEnabled;
     }
 
-    /* ─────────────────────────── Constants ─────────────────────────── */
-
-    uint16 public constant MAX_LEVERAGE_BPS         = 30000;
+    /* ─── Constants ─── */
+    uint16 public constant MAX_LEVERAGE_BPS         = 200000;    // 20x absolute ceiling
     uint16 public constant MAX_ALLOCATION_BPS       = 10000;
     uint16 public constant BPS_DENOM                = 10000;
     uint64 public constant STRESS_WITHDRAW_DELAY    = 12 hours;
@@ -94,22 +107,18 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
     uint16 public constant PERFORMANCE_FEE_BPS      = 1000;
     uint16 public constant MANAGEMENT_FEE_BPS       = 50;
     uint16 public constant HURDLE_RATE_BPS          = 500;
-
-    // New: term bounds and minimum deposit
     uint32 public constant MIN_TERM_MONTHS          = 1;
     uint32 public constant MAX_TERM_MONTHS          = 24;
-    uint256 public constant MIN_DEPOSIT_HYPE        = 1e17;   // 0.1 HYPE
+    uint256 public constant MIN_DEPOSIT_HYPE        = 1e17;      // 0.1 HYPE
 
-    /* ────────────────────── Immutable peer refs ────────────────────── */
-
+    /* ─── Immutable peer refs ─── */
     address public immutable strategyEngine;
     address public immutable positionManager;
     address public immutable riskManager;
     address public immutable yieldRouter;
     IERC20  public immutable usdc;
 
-    /* ─────────────────────────── Storage ─────────────────────────── */
-
+    /* ─── Storage ─── */
     VaultState public vaultState;
     mapping(address => UserPosition) public positions;
     mapping(address => WithdrawalRequest) public withdrawalRequests;
@@ -120,18 +129,19 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
     uint256 public accruedProtocolFeesHype;
     uint64  public lastFeeAccrual;
 
-    /* ─────────────────────────── Events ─────────────────────────── */
-
+    /* ─── Events ─── */
     event PositionOpened(
         address indexed user,
         uint256          hypeDeposit,
         uint256          sharesMinted,
-        HypeLegDirection direction,
-        uint16           leverageBps,
+        bytes32 indexed  perpMarketId,
+        uint16           perpLeverageBps,
         uint16           allocationSplitBps,
+        uint16           reserveSplitBps,
         RiskProfile      profile,
         uint32           termMonths,
-        uint256          usdcDelivered
+        uint256          usdcFromHyperLend,
+        uint256          usdcFromPerpMargin
     );
     event PositionClosed(address indexed user, uint256 hypeReturned, uint256 sharesBurned, LifecycleState finalState);
     event WithdrawalQueued(address indexed user, uint256 shares, uint64 unlockAt);
@@ -140,13 +150,14 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
     event StateTransition(VaultLevelState from, VaultLevelState to);
     event NavRecomputed(uint256 navHype);
     event SmoothingReserveUpdated(address indexed user, uint256 newBalance);
-    event UsdcDebtUpdated(address indexed user, uint256 newDebt);
+    event SpotReserveUpdated(address indexed user, uint256 newBalance);
+    event HyperLendDebtUpdated(address indexed user, uint256 newDebt);
+    event PerpMarginWithdrawnUpdated(address indexed user, uint256 newAmount);
     event CreditBalanceUpdated(address indexed user, uint256 newBalance);
     event ProtocolFeesAccrued(uint256 amountHype);
     event ProtocolFeesClaimed(address indexed to, uint256 amountHype);
 
-    /* ─────────────────────────── Errors ─────────────────────────── */
-
+    /* ─── Errors ─── */
     error ZeroAddress();
     error ZeroAmount();
     error ZeroShares();
@@ -164,9 +175,9 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
     error RebalanceTooSoon(uint64 lastRebalance, uint64 nowTs);
     error UnauthorizedCaller(address caller);
     error UseDepositWithProfile();
+    error InvalidPerpMarket();
 
-    /* ─────────────────────────── Constructor ─────────────────────────── */
-
+    /* ─── Constructor ─── */
     constructor(
         IERC20  hype,
         IERC20  _usdc,
@@ -206,144 +217,142 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         vaultState.lastAccrual      = uint64(block.timestamp);
         lastFeeAccrual              = uint64(block.timestamp);
 
-        // Allow PositionManager to pull HYPE from this vault for leg margin.
-        // Trust is implicit via the immutable reference.
+        // PositionManager pulls HYPE from this vault for both legs.
         hype.approve(_positionManager, type(uint256).max);
     }
 
-    /* ──────────────────────── Deposit (entry point) ──────────────────────── */
+    /* ─── depositWithProfile (entry point) ─── */
 
-    /// @notice Open a Carry Vault position with all four user dials. Pulls HYPE
-    ///         from the caller, mints xCarry shares, opens HYPE and funding
-    ///         legs via StrategyEngine, and delivers borrowed USDC to the user.
-    /// @param  amount             HYPE deposited (in 1e18 units).
-    /// @param  direction          NONE / LONG / SHORT — direction of the HYPE leg.
-    /// @param  allocationSplitBps % of margin to the HYPE leg (0 to 10000).
-    /// @param  profile            CONSERVATIVE or RISKY. Determines leverage and caps.
-    /// @param  termMonths         User's intended borrow horizon.
+    /// @notice Open a Carry Vault position. Splits HYPE into spot reserve,
+    ///         lending-leg supply (HyperLend), and perp-leg margin (HyperCore).
+    /// @param  amount             HYPE deposited (1e18 units).
+    /// @param  allocationSplitBps Of the deployable HYPE (after reserve), percent
+    ///                            allocated to the lending leg.
+    /// @param  profile            CONSERVATIVE or RISKY.
+    /// @param  termMonths         User's intended borrow horizon, 1–24.
     /// @return shares             xCarry shares minted to the caller.
     function depositWithProfile(
         uint256 amount,
-        HypeLegDirection direction,
-        uint16 allocationSplitBps,
+        uint16  allocationSplitBps,
         RiskProfile profile,
-        uint32 termMonths
+        uint32  termMonths
     )
         external
         nonReentrant
         whenNotPaused
         returns (uint256 shares)
     {
-        // ── 1. Vault state checks ──
+        // ── 1. Vault state ──
         if (vaultState.state != VaultLevelState.NORMAL) revert VaultNotInNormalState(vaultState.state);
         if (!vaultState.depositsEnabled)                 revert DepositsDisabled();
-        if (positions[msg.sender].state != LifecycleState.NONE && positions[msg.sender].state != LifecycleState.CLOSED) {
-            revert PositionAlreadyOpen(msg.sender);
-        }
 
-        // ── 2. User state check ──
-        if (positions[msg.sender].state == LifecycleState.OPEN) {
+        // ── 2. User state ──
+        LifecycleState s = positions[msg.sender].state;
+        if (s == LifecycleState.OPEN || s == LifecycleState.REPAYING) {
             revert PositionAlreadyOpen(msg.sender);
         }
 
         // ── 3. Input validation ──
-        if (amount == 0)                                  revert ZeroAmount();
-        if (amount < MIN_DEPOSIT_HYPE)                    revert BelowMinDeposit(amount, MIN_DEPOSIT_HYPE);
-        if (allocationSplitBps > MAX_ALLOCATION_BPS)      revert InvalidAllocationSplit(allocationSplitBps);
+        if (amount == 0)                              revert ZeroAmount();
+        if (amount < MIN_DEPOSIT_HYPE)                revert BelowMinDeposit(amount, MIN_DEPOSIT_HYPE);
+        if (allocationSplitBps > MAX_ALLOCATION_BPS)  revert InvalidAllocationSplit(allocationSplitBps);
         if (termMonths < MIN_TERM_MONTHS || termMonths > MAX_TERM_MONTHS) revert InvalidTerm(termMonths);
 
-        // ── 4. Resolve leverage from the chosen profile (canonical source: RiskManager) ──
-        uint16 leverageBps = IRiskManagerMin(riskManager).getHypeLegLeverageForProfile(uint8(profile));
-        if (leverageBps == 0 || leverageBps > MAX_LEVERAGE_BPS) revert InvalidLeverage(leverageBps);
+        // ── 4. Resolve profile-driven parameters from peers ──
+        uint16  perpLeverageBps    = IRiskManagerMin(riskManager).getPerpLeverageForProfile(uint8(profile));
+        uint16  reserveSplitBps    = IRiskManagerMin(riskManager).getReserveSplitForProfile(uint8(profile));
+        uint16  hyperLendTargetLtv = IRiskManagerMin(riskManager).getHyperLendTargetLtv(uint8(profile));
+        bytes32 perpMarketId       = IStrategyEngineMin(strategyEngine).currentPerpMarket();
+        if (perpLeverageBps == 0 || perpLeverageBps > MAX_LEVERAGE_BPS) revert InvalidLeverage(perpLeverageBps);
+        if (perpMarketId == bytes32(0))                                  revert InvalidPerpMarket();
 
-        // ── 5. Share calculation ──
+        // ── 5. Compute HYPE allocations ──
+        uint256 reserveAmount = (amount * reserveSplitBps) / BPS_DENOM;
+        uint256 deployable    = amount - reserveAmount;
+        uint256 lendingAmount = (deployable * allocationSplitBps) / BPS_DENOM;
+        uint256 perpAmount    = deployable - lendingAmount;
+
+        // ── 6. Share calculation ──
         shares = previewDeposit(amount);
         if (shares == 0) revert ZeroShares();
 
-        // ── 6. Pull HYPE & mint shares (OZ ERC-4626 internal flow) ──
+        // ── 7. Pull HYPE & mint shares (OZ ERC-4626 internal flow) ──
         _deposit(msg.sender, msg.sender, amount, shares);
 
-        // ── 7. Record user position ──
+        // ── 8. Record user position (debts mirrored after peer calls) ──
         positions[msg.sender] = UserPosition({
             user:                    msg.sender,
             openedAt:                uint64(block.timestamp),
             hypeDeposit:             amount,
-            hypeLegDirection:        direction,
-            hypeLegLeverageBps:      leverageBps,
             allocationSplitBps:      allocationSplitBps,
+            reserveSplitBps:         reserveSplitBps,
             riskProfile:             profile,
             termPreferenceMonths:    termMonths,
-            usdcDebt:                0,
+            perpMarketId:            perpMarketId,
+            hyperLendDebtUsd:        0,
+            perpMarginWithdrawnUsd:  0,
+            spotReserveBalance:      reserveAmount,
             smoothingReserveBalance: 0,
             creditBalance:           0,
             state:                   LifecycleState.OPEN
         });
         _addActiveUser(msg.sender);
 
-        // ── 8. Compute leg margins (in HYPE units; downstream converts to USD) ──
-        uint256 hypeLegMargin    = (amount * allocationSplitBps) / BPS_DENOM;
-        uint256 fundingLegMargin = amount - hypeLegMargin;
-
-        // ── 9. Open HYPE leg if the user chose a direction ──
-        if (direction != HypeLegDirection.NONE && hypeLegMargin > 0) {
-            IStrategyEngineMin(strategyEngine).openHypeLeg(
-                msg.sender,
-                uint8(direction),
-                hypeLegMargin,
-                leverageBps
+        // ── 9. Open lending leg via PositionManager ──
+        uint256 usdcFromHyperLend = 0;
+        if (lendingAmount > 0) {
+            usdcFromHyperLend = IPositionManagerMin(positionManager).supplyToHyperLendAndBorrow(
+                msg.sender, lendingAmount, hyperLendTargetLtv
             );
         }
 
-        // ── 10. Activate funding leg (allocates user's funding margin across global portfolio) ──
-        if (fundingLegMargin > 0) {
-            IStrategyEngineMin(strategyEngine).activateUserFundingLeg(msg.sender, fundingLegMargin);
+        // ── 10. Open perp leg via PositionManager (HYPE→USDC, perp open, leverage, margin withdraw) ──
+        uint256 usdcFromPerpMargin = 0;
+        if (perpAmount > 0) {
+            usdcFromPerpMargin = IPositionManagerMin(positionManager).openPerpLegAndExtractMargin(
+                msg.sender, perpMarketId, perpAmount, perpLeverageBps
+            );
         }
 
-        // ── 11. Open Sentiment account, post collateral, borrow USDC, deliver to user ──
-        uint256 usdcDelivered = IPositionManagerMin(positionManager).openSentimentAndBorrow(msg.sender);
-
-        // ── 12. Mirror the new debt into per-user state ──
-        positions[msg.sender].usdcDebt = usdcDelivered;
-        vaultState.totalUsdcDebtOutstanding += usdcDelivered;
+        // ── 11. Mirror debts into per-user state ──
+        positions[msg.sender].hyperLendDebtUsd       = usdcFromHyperLend;
+        positions[msg.sender].perpMarginWithdrawnUsd = usdcFromPerpMargin;
+        vaultState.totalUsdcDebtOutstanding         += usdcFromHyperLend + usdcFromPerpMargin;
 
         emit PositionOpened(
             msg.sender,
             amount,
             shares,
-            direction,
-            leverageBps,
+            perpMarketId,
+            perpLeverageBps,
             allocationSplitBps,
+            reserveSplitBps,
             profile,
             termMonths,
-            usdcDelivered
+            usdcFromHyperLend,
+            usdcFromPerpMargin
         );
     }
 
-    /* ────────────── Override standard ERC-4626 entry points ────────────── */
-
-    /// @dev Disable the vanilla ERC-4626 deposit() — users must use depositWithProfile.
+    /* ─── Override standard ERC-4626 entry points ─── */
     function deposit(uint256, address) public pure override returns (uint256) {
         revert UseDepositWithProfile();
     }
-
-    /// @dev Disable the vanilla ERC-4626 mint() for the same reason.
     function mint(uint256, address) public pure override returns (uint256) {
         revert UseDepositWithProfile();
     }
 
-    /* ────────────────────── Internal helpers ────────────────────── */
-
+    /* ─── Internal helpers ─── */
     function _addActiveUser(address user) internal {
         if (_activeUserIndex[user] == 0) {
             activeUsers.push(user);
-            _activeUserIndex[user] = activeUsers.length;  // 1-based
+            _activeUserIndex[user] = activeUsers.length;
         }
     }
 
     function _removeActiveUser(address user) internal {
         uint256 idx = _activeUserIndex[user];
         if (idx == 0) return;
-
         uint256 lastIdx = activeUsers.length;
         if (idx != lastIdx) {
             address last = activeUsers[lastIdx - 1];
@@ -353,22 +362,4 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         activeUsers.pop();
         delete _activeUserIndex[user];
     }
-
-    /* ─────────────────────────── Future stubs ───────────────────────────
-
-       function requestWithdraw(uint256 shares) external;
-       function fulfillWithdraw() external;
-       function repay() external;
-       function rebalance() external;                                // keeper
-       function forceClose(address user) external;                   // RiskManager
-       function setVaultState(VaultLevelState newState) external;    // RiskManager
-       function updateUsdcDebt(address user, uint256 newDebt) external;        // STRATEGY_ROLE / YIELD_ROUTER_ROLE
-       function updateSmoothingReserve(address user, uint256 newBal) external; // YIELD_ROUTER_ROLE
-       function updateCreditBalance(address user, uint256 newBal) external;    // YIELD_ROUTER_ROLE
-       function pause() / unpause();
-       function setDepositsEnabled(bool);
-       function collectProtocolFees(address to);
-       function totalAssets() override returns (uint256);            // §6 NAV — must include perp legs + PnL
-       function getActiveUsersCount() returns (uint256);
-       ─────────────────────────────────────────────────────────────── */
 }
