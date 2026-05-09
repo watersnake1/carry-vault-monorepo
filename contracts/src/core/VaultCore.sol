@@ -28,14 +28,24 @@ interface IPositionManagerMin {
         address user,
         bytes32 marketId,
         uint256 hypeAmount,
-        uint16  leverageBps
+        uint32  leverageBps
     ) external returns (uint256 marginWithdrawnUsd);
+    function closePerpLegFull(address user) external returns (uint256 hypeReturned);
+    function withdrawAllPerpMargin(address user) external returns (uint256 marginUsd);
+    function repayHyperLendFromCollateral(address user) external returns (uint256 hypeReturned);
 }
 
 interface IRiskManagerMin {
-    function getPerpLeverageForProfile(uint8 profile) external view returns (uint16 leverageBps);
+    function getPerpLeverageForProfile(uint8 profile) external view returns (uint32 leverageBps);
     function getReserveSplitForProfile(uint8 profile) external view returns (uint16 reserveBps);
     function getHyperLendTargetLtv(uint8 profile)    external view returns (uint16 ltvBps);
+    function requiresCascade(address user)           external view returns (bool);
+    function executeCascade(address user)            external;
+}
+
+interface IYieldRouterMin {
+    function registerUser(address user, uint8 profile, uint256 hypeDeposit) external;
+    function unregisterUser(address user) external;
 }
 
 /// @title  VaultCore
@@ -99,7 +109,7 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
     }
 
     /* ─── Constants ─── */
-    uint16 public constant MAX_LEVERAGE_BPS         = 200000;    // 20x absolute ceiling
+    uint32 public constant MAX_LEVERAGE_BPS         = 200000;    // 20x absolute ceiling
     uint16 public constant MAX_ALLOCATION_BPS       = 10000;
     uint16 public constant BPS_DENOM                = 10000;
     uint64 public constant STRESS_WITHDRAW_DELAY    = 12 hours;
@@ -135,7 +145,7 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         uint256          hypeDeposit,
         uint256          sharesMinted,
         bytes32 indexed  perpMarketId,
-        uint16           perpLeverageBps,
+        uint32           perpLeverageBps,
         uint16           allocationSplitBps,
         uint16           reserveSplitBps,
         RiskProfile      profile,
@@ -156,14 +166,14 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
     event CreditBalanceUpdated(address indexed user, uint256 newBalance);
     event ProtocolFeesAccrued(uint256 amountHype);
     event ProtocolFeesClaimed(address indexed to, uint256 amountHype);
-
+    event PaydownApplied(address indexed user, uint256 amountPaid, uint256 newDebt, uint256 overageToCredit);
     /* ─── Errors ─── */
     error ZeroAddress();
     error ZeroAmount();
     error ZeroShares();
     error BelowMinDeposit(uint256 supplied, uint256 minimum);
     error InvalidAllocationSplit(uint16 supplied);
-    error InvalidLeverage(uint16 supplied);
+    error InvalidLeverage(uint32 supplied);
     error InvalidTerm(uint32 supplied);
     error DepositsDisabled();
     error VaultNotInNormalState(VaultLevelState current);
@@ -259,7 +269,7 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         if (termMonths < MIN_TERM_MONTHS || termMonths > MAX_TERM_MONTHS) revert InvalidTerm(termMonths);
 
         // ── 4. Resolve profile-driven parameters from peers ──
-        uint16  perpLeverageBps    = IRiskManagerMin(riskManager).getPerpLeverageForProfile(uint8(profile));
+        uint32  perpLeverageBps    = IRiskManagerMin(riskManager).getPerpLeverageForProfile(uint8(profile));
         uint16  reserveSplitBps    = IRiskManagerMin(riskManager).getReserveSplitForProfile(uint8(profile));
         uint16  hyperLendTargetLtv = IRiskManagerMin(riskManager).getHyperLendTargetLtv(uint8(profile));
         bytes32 perpMarketId       = IStrategyEngineMin(strategyEngine).currentPerpMarket();
@@ -297,6 +307,8 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
             state:                   LifecycleState.OPEN
         });
         _addActiveUser(msg.sender);
+        // Register with YieldRouter for funding-income distribution.
+        IYieldRouterMin(yieldRouter).registerUser(msg.sender, uint8(profile), amount);
 
         // ── 9. Open lending leg via PositionManager ──
         uint256 usdcFromHyperLend = 0;
@@ -334,12 +346,114 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         );
     }
 
+    /// @notice Voluntary unwind. Closes the perp leg, repays HyperLend from
+    ///         collateral, returns all HYPE (collateral + perp + spot reserve)
+    ///         to the user, burns their xCarry shares, and unregisters them
+    ///         from YieldRouter.
+    function repay()
+        external
+        nonReentrant
+        whenNotPaused
+    {
+        UserPosition storage pos = positions[msg.sender];
+        if (pos.state != LifecycleState.OPEN) revert PositionNotOpen(msg.sender);
+
+        // 1. Mark transitioning to prevent reentry on the same position.
+        pos.state = LifecycleState.REPAYING;
+
+        uint256 totalDebtBefore = pos.hyperLendDebtUsd + pos.perpMarginWithdrawnUsd;
+        uint256 spotReserve     = pos.spotReserveBalance;
+        uint256 sharesToBurn    = balanceOf(msg.sender);
+
+        // 2. Close perp leg → returns originalHypeAmount, transfers HYPE to vault.
+        uint256 hypeFromPerp = IPositionManagerMin(positionManager).closePerpLegFull(msg.sender);
+
+        // 3. Withdraw remaining perp margin (state cleanup; no HYPE in V1 stub).
+        IPositionManagerMin(positionManager).withdrawAllPerpMargin(msg.sender);
+
+        // 4. Repay HyperLend → returns hypeSupplied, transfers HYPE to vault.
+        uint256 hypeFromLending = IPositionManagerMin(positionManager).repayHyperLendFromCollateral(msg.sender);
+
+        // 5. Total HYPE owed back to user = perp + lending + reserve.
+        uint256 totalHype = hypeFromPerp + hypeFromLending + spotReserve;
+
+        // 6. Burn shares. ERC-4626 share burn happens before transferring assets out.
+        if (sharesToBurn > 0) {
+            _burn(msg.sender, sharesToBurn);
+        }
+
+        // 7. Update vault-wide totals and clear per-user accounting.
+        vaultState.totalUsdcDebtOutstanding -= totalDebtBefore;
+
+        pos.hyperLendDebtUsd        = 0;
+        pos.perpMarginWithdrawnUsd  = 0;
+        pos.spotReserveBalance      = 0;
+        pos.smoothingReserveBalance = 0;
+        pos.creditBalance           = 0;
+        pos.state                   = LifecycleState.CLOSED;
+
+        // 8. Remove from active users.
+        _removeActiveUser(msg.sender);
+
+        // 9. Unregister from YieldRouter.
+        IYieldRouterMin(yieldRouter).unregisterUser(msg.sender);
+
+        // 10. Transfer all HYPE back to user.
+        if (totalHype > 0) {
+            IERC20(asset()).safeTransfer(msg.sender, totalHype);
+        }
+
+        emit PositionClosed(msg.sender, totalHype, sharesToBurn, LifecycleState.CLOSED);
+    }
+
     /* ─── Override standard ERC-4626 entry points ─── */
     function deposit(uint256, address) public pure override returns (uint256) {
         revert UseDepositWithProfile();
     }
     function mint(uint256, address) public pure override returns (uint256) {
         revert UseDepositWithProfile();
+    }
+
+    /// @notice Keeper entry point. Permissionless but rate-limited. Iterates
+    ///         active users and triggers cascade for any whose health crossed
+    ///         the trigger threshold. Silent no-op if called too frequently or
+    ///         while the vault is winding down.
+    function rebalance() external {
+        uint64 nowTs = uint64(block.timestamp);
+
+        // Rate-limit: silent no-op
+        if (nowTs < vaultState.lastRebalance + MIN_REBALANCE_INTERVAL) return;
+
+        // No work during winddown
+        if (vaultState.state == VaultLevelState.WINDDOWN) return;
+
+        // Update timestamp regardless of whether cascade work happens. This makes
+        // the rate limit enforce a wall-clock minimum interval.
+        vaultState.lastRebalance = nowTs;
+
+        // Iterate active users. Cascade Stage C may remove a user mid-iteration,
+        // so we read activeUsers.length each loop and only advance i when the
+        // current user wasn't removed.
+        uint256 i = 0;
+        while (i < activeUsers.length) {
+            address user = activeUsers[i];
+
+            if (positions[user].state == LifecycleState.OPEN) {
+                if (IRiskManagerMin(riskManager).requiresCascade(user)) {
+                    uint256 lengthBefore = activeUsers.length;
+                    IRiskManagerMin(riskManager).executeCascade(user);
+
+                    if (activeUsers.length < lengthBefore) {
+                        // Stage C ran — user was removed and the slot now holds
+                        // the previous-last user. Re-process index i.
+                        continue;
+                    }
+                }
+            }
+            i++;
+        }
+
+        emit RebalanceTick(nowTs, vaultState.navHype);
     }
 
     /* ─── Internal helpers ─── */
@@ -361,5 +475,172 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         }
         activeUsers.pop();
         delete _activeUserIndex[user];
+    }
+
+    /* ─────────────────────────── State setters (called by peer contracts) ─────────────────────────── */
+
+    /// @notice Update outstanding HyperLend debt for a user.
+    /// @dev Callable by StrategyEngine or YieldRouter.
+    function updateHyperLendDebt(address user, uint256 newDebt) external {
+        if (!hasRole(STRATEGY_ROLE, msg.sender) && !hasRole(YIELD_ROUTER_ROLE, msg.sender)) {
+            revert UnauthorizedCaller(msg.sender);
+        }
+        UserPosition storage pos = positions[user];
+        if (pos.state == LifecycleState.NONE || pos.state == LifecycleState.CLOSED) {
+            revert PositionNotOpen(user);
+        }
+
+        uint256 oldDebt = pos.hyperLendDebtUsd;
+        pos.hyperLendDebtUsd = newDebt;
+
+        if (newDebt >= oldDebt) {
+            vaultState.totalUsdcDebtOutstanding += (newDebt - oldDebt);
+        } else {
+            vaultState.totalUsdcDebtOutstanding -= (oldDebt - newDebt);
+        }
+
+        emit HyperLendDebtUpdated(user, newDebt);
+    }
+
+    /// @notice Update USDC withdrawn from the perp margin account.
+    /// @dev StrategyEngine-only — this is the perp-leg state, not lending-leg.
+    function updatePerpMarginWithdrawn(address user, uint256 newAmount)
+        external
+        onlyRole(STRATEGY_ROLE)
+    {
+        UserPosition storage pos = positions[user];
+        if (pos.state == LifecycleState.NONE || pos.state == LifecycleState.CLOSED) {
+            revert PositionNotOpen(user);
+        }
+
+        uint256 oldAmount = pos.perpMarginWithdrawnUsd;
+        pos.perpMarginWithdrawnUsd = newAmount;
+
+        if (newAmount >= oldAmount) {
+            vaultState.totalUsdcDebtOutstanding += (newAmount - oldAmount);
+        } else {
+            vaultState.totalUsdcDebtOutstanding -= (oldAmount - newAmount);
+        }
+
+        emit PerpMarginWithdrawnUpdated(user, newAmount);
+    }
+
+    /// @notice Sync user's smoothing reserve mirror from YieldRouter.
+    function updateSmoothingReserve(address user, uint256 newBalance)
+        external
+        onlyRole(YIELD_ROUTER_ROLE)
+    {
+        UserPosition storage pos = positions[user];
+        if (pos.state == LifecycleState.NONE) revert PositionNotOpen(user);
+        pos.smoothingReserveBalance = newBalance;
+        emit SmoothingReserveUpdated(user, newBalance);
+    }
+
+    /// @notice Sync user's credit balance mirror from YieldRouter.
+    function updateCreditBalance(address user, uint256 newBalance)
+        external
+        onlyRole(YIELD_ROUTER_ROLE)
+    {
+        UserPosition storage pos = positions[user];
+        if (pos.state == LifecycleState.NONE) revert PositionNotOpen(user);
+        pos.creditBalance = newBalance;
+        emit CreditBalanceUpdated(user, newBalance);
+    }
+
+    /// @notice Update user's spot HYPE reserve balance.
+    /// @dev Callable by YieldRouter (top-up from funding income) or RiskManager
+    ///      (drawdown during cascade Stage A).
+    function updateSpotReserve(address user, uint256 newBalance) external {
+        if (!hasRole(YIELD_ROUTER_ROLE, msg.sender) && !hasRole(RISK_MANAGER_ROLE, msg.sender)) {
+            revert UnauthorizedCaller(msg.sender);
+        }
+        UserPosition storage pos = positions[user];
+        if (pos.state == LifecycleState.NONE) revert PositionNotOpen(user);
+        pos.spotReserveBalance = newBalance;
+        emit SpotReserveUpdated(user, newBalance);
+    }
+
+    /// @notice Apply a principal paydown — reduces hyperLendDebtUsd, with
+    ///         any overage going to creditBalance. Convenience over raw
+    ///         updateHyperLendDebt + updateCreditBalance.
+    function applyPaydown(address user, uint256 amount)
+        external
+        onlyRole(YIELD_ROUTER_ROLE)
+        returns (uint256 paid, uint256 overage)
+    {
+        UserPosition storage pos = positions[user];
+        if (pos.state == LifecycleState.NONE || pos.state == LifecycleState.CLOSED) {
+            revert PositionNotOpen(user);
+        }
+
+        uint256 currentDebt = pos.hyperLendDebtUsd;
+        if (amount >= currentDebt) {
+            paid                 = currentDebt;
+            overage              = amount - currentDebt;
+            pos.hyperLendDebtUsd = 0;
+            pos.creditBalance   += overage;
+            emit CreditBalanceUpdated(user, pos.creditBalance);
+        } else {
+            paid                 = amount;
+            pos.hyperLendDebtUsd = currentDebt - amount;
+        }
+
+        vaultState.totalUsdcDebtOutstanding -= paid;
+
+        emit HyperLendDebtUpdated(user, pos.hyperLendDebtUsd);
+        emit PaydownApplied(user, paid, pos.hyperLendDebtUsd, overage);
+    }
+
+    function getUserSpotReserveBalance(address user) external view returns (uint256) {
+        return positions[user].spotReserveBalance;
+    }
+
+    /// @notice RiskManager-only forced unwind. Mirrors repay() but unilateral
+///         and sets state to FORCE_CLOSED.
+function forceClose(address user)
+    external
+    onlyRole(RISK_MANAGER_ROLE)
+    nonReentrant
+    {
+        UserPosition storage pos = positions[user];
+        if (pos.state != LifecycleState.OPEN && pos.state != LifecycleState.REPAYING) {
+            revert PositionNotOpen(user);
+        }
+
+        pos.state = LifecycleState.REPAYING;     // intermediate
+
+        uint256 totalDebtBefore = pos.hyperLendDebtUsd + pos.perpMarginWithdrawnUsd;
+        uint256 spotReserve     = pos.spotReserveBalance;
+        uint256 sharesToBurn    = balanceOf(user);
+
+        // Close perp + repay HyperLend; PM transfers HYPE back to vault
+        uint256 hypeFromPerp    = IPositionManagerMin(positionManager).closePerpLegFull(user);
+        IPositionManagerMin(positionManager).withdrawAllPerpMargin(user);
+        uint256 hypeFromLending = IPositionManagerMin(positionManager).repayHyperLendFromCollateral(user);
+
+        uint256 totalHype = hypeFromPerp + hypeFromLending + spotReserve;
+
+        if (sharesToBurn > 0) {
+            _burn(user, sharesToBurn);
+        }
+
+        vaultState.totalUsdcDebtOutstanding -= totalDebtBefore;
+
+        pos.hyperLendDebtUsd        = 0;
+        pos.perpMarginWithdrawnUsd  = 0;
+        pos.spotReserveBalance      = 0;
+        pos.smoothingReserveBalance = 0;
+        pos.creditBalance           = 0;
+        pos.state                   = LifecycleState.FORCE_CLOSED;
+
+        _removeActiveUser(user);
+
+        IYieldRouterMin(yieldRouter).unregisterUser(user);
+
+        if (totalHype > 0) {
+            IERC20(asset()).safeTransfer(user, totalHype);
+        }
+
+        emit PositionClosed(user, totalHype, sharesToBurn, LifecycleState.FORCE_CLOSED);
     }
 }
