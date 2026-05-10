@@ -117,6 +117,34 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         bool    depositsEnabled;
     }
 
+    struct UserView {
+        // Raw position fields
+        UserPosition position;
+
+        // ERC-4626 share state
+        uint256 shares;
+
+        // Withdrawal queue state (zeros if none queued)
+        uint256 pendingWithdrawalShares;
+        uint64  withdrawalUnlockAt;
+        bool    hasPendingWithdrawal;
+    }
+
+    struct VaultView {
+        VaultLevelState level;
+        uint256 totalAssetsHype;
+        uint256 totalSharesIssued;
+        uint256 activeUsersCount;
+        uint256 accumulatedProtocolFees;
+        bool    depositsEnabled;
+        bool    isPaused;
+        // Component addresses for frontend convenience
+        address strategyEngine;
+        address positionManager;
+        address riskManager;
+        address yieldRouter;
+    }
+
     /* ─── Constants ─── */
     uint32 public constant MAX_LEVERAGE_BPS         = 200000;    // 20x absolute ceiling
     uint16 public constant MAX_ALLOCATION_BPS       = 10000;
@@ -541,6 +569,8 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         if (pos.state != LifecycleState.OPEN) revert PositionNotOpen(msg.sender);
 
         uint256 shares = req.shares;
+        uint256 spotHype = pos.spotReserveBalance;
+        pos.spotReserveBalance = 0;
 
         // Per-user recovery: each PM call returns exactly the HYPE attributable
         // to this user's legs and transfers it here.
@@ -548,12 +578,14 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         uint256 lendingHype = IPositionManagerMin(positionManager).repayHyperLendFromCollateral(msg.sender);
         uint256 reserves    = IYieldRouterMin(yieldRouter).drainUserReserves(msg.sender);
 
-        uint256 totalReturn = perpHype + lendingHype + reserves;
+        uint256 totalReturn = spotHype + perpHype + lendingHype + reserves;
 
         _burn(address(this), shares);
 
         req.fulfilled = true;
         pos.state = LifecycleState.CLOSED;
+        _removeActiveUser(msg.sender);
+
         IYieldRouterMin(yieldRouter).unregisterUser(msg.sender);
 
         if (totalReturn > 0) {
@@ -812,6 +844,7 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
     /// @notice Real NAV in HYPE. Sums each active user's position components.
     /// @dev    Approximation: uses recorded position state + reserves. Doesn't include
     ///         unrealized perp PnL beyond what's reflected in margin-withdrawn USD.
+    /* OLD VER
     function totalAssets() public view override returns (uint256 totalHype) {
         uint256 hypeUsd = IOracleLayerMin(oracle).hypePriceUsdc(); // USDC per HYPE, 1e6 scale
 
@@ -848,5 +881,59 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         // Add idle HYPE in vault not attributed to any active user (e.g. recovered but not paid out)
         uint256 idle = IERC20(asset()).balanceOf(address(this));
         totalHype += idle;
+    }
+    */
+    /// @notice Real NAV in HYPE. Sums all HYPE physically held by protocol contracts.
+    /// @dev    V1: doesn't include unrealized perp PnL (USDC-denominated on HC) or
+    ///         accumulated USDC protocol fees. Sufficient for share pricing while
+    ///         all HYPE flows route through vault/PM/YR.
+    function totalAssets() public view override returns (uint256) {
+        IERC20 hypeToken = IERC20(asset());
+        return hypeToken.balanceOf(address(this))
+            + hypeToken.balanceOf(positionManager)
+            + hypeToken.balanceOf(yieldRouter);
+    }
+
+    /// @notice Full position record for a user. Returns a zeroed struct if no position.
+    function getUserPosition(address user) external view returns (UserPosition memory) {
+        return positions[user];
+    }
+
+    /// @notice Composite view: position + shares + withdrawal queue state.
+    function getUserView(address user) external view returns (UserView memory v) {
+        v.position = positions[user];
+        v.shares   = balanceOf(user);
+
+        WithdrawalRequest storage req = withdrawalRequests[user];
+        if (req.requestedAt != 0 && !req.fulfilled) {
+            v.pendingWithdrawalShares = req.shares;
+            v.withdrawalUnlockAt      = req.unlockAt;
+            v.hasPendingWithdrawal    = true;
+        }
+    }
+
+    /// @notice Number of users with currently active positions.
+    function getActiveUsersCount() external view returns (uint256) {
+        return activeUsers.length;
+    }
+
+    /// @notice Full active-user roster. Use sparingly — O(n) memory copy.
+    function getActiveUsers() external view returns (address[] memory) {
+        return activeUsers;
+    }
+
+    /// @notice Vault-level metrics for dashboards.
+    function getVaultView() external view returns (VaultView memory v) {
+        v.level                   = vaultState.state;
+        v.totalAssetsHype         = totalAssets();
+        v.totalSharesIssued       = totalSupply();
+        v.activeUsersCount        = activeUsers.length;
+        v.accumulatedProtocolFees = accumulatedProtocolFees;
+        v.depositsEnabled         = depositsEnabled;
+        v.isPaused                = paused();
+        v.strategyEngine          = strategyEngine;
+        v.positionManager         = positionManager;
+        v.riskManager             = riskManager;
+        v.yieldRouter             = yieldRouter;
     }
 }
