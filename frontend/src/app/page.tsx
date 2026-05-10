@@ -4,6 +4,7 @@ import { useReadContract } from "wagmi";
 import { formatEther, formatUnits } from "viem";
 import VaultAbi from "@/abi/VaultCore.json";
 import { VAULT_ADDRESS } from "@/lib/wagmi";
+import { useHypePrice, useMarketData } from "@/lib/usePrices";
 
 const VAULT_STATE_LABELS = ["NORMAL", "STRESS", "EMERGENCY", "WINDDOWN"];
 
@@ -19,6 +20,9 @@ export default function StatsPage() {
     functionName: "getVaultView",
     query: { refetchInterval: 10_000 },
   });
+  const { priceUsd: hypePrice } = useHypePrice();
+  const btc = useMarketData("BTC");
+  const eth = useMarketData("ETH");
 
   if (isLoading) return <Loading />;
   if (error)     return <ErrorBox message={error.message} />;
@@ -59,7 +63,42 @@ export default function StatsPage() {
           value={`${view.depositsEnabled ? "Deposits ON" : "Deposits OFF"} • ${view.isPaused ? "PAUSED" : "Live"}`}
         />
       </div>
+      <div className="border border-zinc-800 rounded-lg p-5 space-y-4">
+  <h3 className="text-sm text-zinc-400">Live Market Data</h3>
 
+  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+      <Stat label="HYPE Spot" value={`$${hypePrice.toFixed(4)}`} />
+      {btc.markPrice !== undefined && (
+        <Stat
+          label="BTC Perp"
+          value={`$${btc.markPrice.toFixed(0)}`}
+          accent={btc.fundingHourlyPct > 0 ? "text-emerald-400" : "text-red-400"}
+        />
+      )}
+      {eth.markPrice !== undefined && (
+        <Stat
+          label="ETH Perp"
+          value={`$${eth.markPrice.toFixed(2)}`}
+          accent={eth.fundingHourlyPct > 0 ? "text-emerald-400" : "text-red-400"}
+        />
+      )}
+    </div>
+
+    {btc.markPrice !== undefined && (
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
+        <div className="text-zinc-500">
+          BTC funding: <span className="text-zinc-300">{btc.fundingHourlyPct.toFixed(4)}%/h</span>{" "}
+          <span className="text-zinc-600">({btc.fundingAnnualPct.toFixed(1)}% annualized)</span>
+        </div>
+        {eth.markPrice !== undefined && (
+          <div className="text-zinc-500">
+            ETH funding: <span className="text-zinc-300">{eth.fundingHourlyPct.toFixed(4)}%/h</span>{" "}
+            <span className="text-zinc-600">({eth.fundingAnnualPct.toFixed(1)}% annualized)</span>
+          </div>
+        )}
+      </div>
+    )}
+  </div>
       <div className="border border-zinc-800 rounded-lg p-4 text-xs text-zinc-500 space-y-1">
         <h3 className="text-zinc-400 mb-2 text-sm">Component Addresses</h3>
         <Row label="Strategy"   value={view.strategyEngine} />

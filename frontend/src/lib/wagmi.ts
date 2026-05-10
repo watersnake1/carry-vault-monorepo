@@ -29,3 +29,4 @@ export const wagmiConfig = getDefaultConfig({
 export const VAULT_ADDRESS = process.env.NEXT_PUBLIC_VAULT_ADDRESS as `0x${string}`;
 export const HYPE_ADDRESS  = process.env.NEXT_PUBLIC_HYPE_ADDRESS  as `0x${string}`;
 export const USDC_ADDRESS  = process.env.NEXT_PUBLIC_USDC_ADDRESS  as `0x${string}`;
+export const ORACLE_ADDRESS = process.env.NEXT_PUBLIC_ORACLE_ADDRESS as `0x${string}`;

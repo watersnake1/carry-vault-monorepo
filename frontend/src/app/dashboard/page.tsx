@@ -6,12 +6,13 @@ import { formatEther, formatUnits } from "viem";
 import Link from "next/link";
 import VaultAbi from "@/abi/VaultCore.json";
 import { VAULT_ADDRESS } from "@/lib/wagmi";
+import { useHypePrice } from "@/lib/usePrices";
 
 const VAULT_LEVEL = ["NORMAL", "STRESS", "EMERGENCY", "WINDDOWN"];
 const LIFECYCLE = ["NONE", "OPEN", "REPAYING", "CLOSED", "FORCE_CLOSED"];
 
 // Stub HYPE/USDC price for V1 (matches OracleLayer default)
-const HYPE_PRICE_USDC = 40;
+//const HYPE_PRICE_USDC = 40;
 
 type UserView = {
   position: {
@@ -41,6 +42,7 @@ type VaultView = { level: number };
 export default function DashboardPage() {
   const { address, isConnected } = useAccount();
 
+  const { priceUsd: HYPE_PRICE_USDC } = useHypePrice();
   const [now, setNow] = useState(Math.floor(Date.now() / 1000));
   useEffect(() => {
     const t = setInterval(() => setNow(Math.floor(Date.now() / 1000)), 1000);
