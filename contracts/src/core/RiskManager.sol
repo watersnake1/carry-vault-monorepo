@@ -356,8 +356,9 @@ contract RiskManager is AccessControl {
 
     /// @dev Resolves the user's chosen risk profile from VaultCore.
     ///      Stub returns Conservative until VaultCore exposes a typed getter.
-    function _userProfile(address /*user*/) internal pure returns (Profile) {
+    function _userProfile(address user) internal view returns (Profile) {
         // TODO: return Profile(IVaultCoreMin(vaultCore).getUserRiskProfile(user))
-        return Profile.Conservative;
+        uint8 raw = IVaultCoreMin(vaultCore).getUserRiskProfile(user);
+        return Profile(raw);    
     }
 }

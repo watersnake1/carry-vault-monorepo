@@ -8,6 +8,9 @@ import { SafeERC20 }        from "@openzeppelin/contracts/token/ERC20/utils/Safe
 import { AccessControl }    from "@openzeppelin/contracts/access/AccessControl.sol";
 import { Pausable }         from "@openzeppelin/contracts/utils/Pausable.sol";
 import { ReentrancyGuard }  from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import { OracleLayer }     from "../../src/core/OracleLayer.sol";
+
+
 
 /* ─────────────────────────────────────────────────────────────────────────
    Minimal peer-contract interfaces
@@ -35,6 +38,11 @@ interface IPositionManagerMin {
     function repayHyperLendFromCollateral(address user) external returns (uint256 hypeReturned);
 }
 
+interface IOracleLayerMin {
+    function maintenanceMarginBps(bytes32 marketId) external view returns (uint16);
+    function hypePriceUsdc() external view returns (uint256);
+}
+
 interface IRiskManagerMin {
     function getPerpLeverageForProfile(uint8 profile) external view returns (uint32 leverageBps);
     function getReserveSplitForProfile(uint8 profile) external view returns (uint16 reserveBps);
@@ -46,6 +54,7 @@ interface IRiskManagerMin {
 interface IYieldRouterMin {
     function registerUser(address user, uint8 profile, uint256 hypeDeposit) external;
     function unregisterUser(address user) external;
+    function drainUserReserves(address user) external returns (uint256 totalHype);
 }
 
 /// @title  VaultCore
@@ -127,6 +136,7 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
     address public immutable riskManager;
     address public immutable yieldRouter;
     IERC20  public immutable usdc;
+    address public immutable oracle;
 
     /* ─── Storage ─── */
     VaultState public vaultState;
@@ -138,6 +148,9 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
 
     uint256 public accruedProtocolFeesHype;
     uint64  public lastFeeAccrual;
+
+    bool public depositsEnabled = true;
+    uint256 public accumulatedProtocolFees;  // denominated in USDC
 
     /* ─── Events ─── */
     event PositionOpened(
@@ -167,6 +180,10 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
     event ProtocolFeesAccrued(uint256 amountHype);
     event ProtocolFeesClaimed(address indexed to, uint256 amountHype);
     event PaydownApplied(address indexed user, uint256 amountPaid, uint256 newDebt, uint256 overageToCredit);
+    event VaultStateChanged(VaultLevelState prev, VaultLevelState next);
+    event DepositsEnabledChanged(bool enabled);
+    event ProtocolFeesCollected(address indexed treasury, uint256 amount);
+    //event ProtocolFeesAccrued(uint256 amount);
     /* ─── Errors ─── */
     error ZeroAddress();
     error ZeroAmount();
@@ -186,6 +203,15 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
     error UnauthorizedCaller(address caller);
     error UseDepositWithProfile();
     error InvalidPerpMarket();
+    error InvalidVaultState(VaultLevelState current);
+    error InsufficientShares(uint256 have, uint256 want);
+    error WithdrawalAlreadyQueued(address user);
+    error WithdrawalAlreadyFulfilled(address user);
+    //error DepositsDisabled();
+    error NoFeesToCollect();
+    error TreasuryNotSet();
+
+    event WithdrawalCancelled(address indexed user, uint256 shares);
 
     /* ─── Constructor ─── */
     constructor(
@@ -195,6 +221,7 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         address _positionManager,
         address _riskManager,
         address _yieldRouter,
+        address _oracle,
         address admin
     )
         ERC4626(hype)
@@ -212,6 +239,7 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         positionManager = _positionManager;
         riskManager     = _riskManager;
         yieldRouter     = _yieldRouter;
+        oracle = _oracle;
         usdc            = _usdc;
 
         _grantRole(DEFAULT_ADMIN_ROLE, admin);
@@ -255,6 +283,7 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         // ── 1. Vault state ──
         if (vaultState.state != VaultLevelState.NORMAL) revert VaultNotInNormalState(vaultState.state);
         if (!vaultState.depositsEnabled)                 revert DepositsDisabled();
+        if (!depositsEnabled) revert DepositsDisabled();
 
         // ── 2. User state ──
         LifecycleState s = positions[msg.sender].state;
@@ -456,6 +485,102 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         emit RebalanceTick(nowTs, vaultState.navHype);
     }
 
+    /* Withdrawal */
+    // ============================================================
+    // WITHDRAWAL QUEUE (STRESS-state exit path)
+    // ============================================================
+
+    /// @notice Queue a stress-state withdrawal. Locks shares for STRESS_WITHDRAW_DELAY,
+    ///         then settles via fulfillWithdraw() once the delay has elapsed.
+    /// @dev    Only callable during STRESS or EMERGENCY. NORMAL-state exit goes through repay().
+    function requestWithdraw(uint256 shares) external nonReentrant whenNotPaused {
+        if (shares == 0) revert ZeroAmount();
+
+        if (vaultState.state != VaultLevelState.STRESS && vaultState.state != VaultLevelState.EMERGENCY) {
+            revert InvalidVaultState(vaultState.state);
+        }
+
+        UserPosition storage pos = positions[msg.sender];
+        if (pos.state != LifecycleState.OPEN) revert PositionNotOpen(msg.sender);
+
+        uint256 bal = balanceOf(msg.sender);
+        if (bal < shares) revert InsufficientShares(bal, shares);
+
+        WithdrawalRequest storage existing = withdrawalRequests[msg.sender];
+        if (existing.requestedAt != 0 && !existing.fulfilled) {
+            revert WithdrawalAlreadyQueued(msg.sender);
+        }
+
+        _transfer(msg.sender, address(this), shares);
+
+        uint64 unlockAt = uint64(block.timestamp) + uint64(STRESS_WITHDRAW_DELAY);
+        withdrawalRequests[msg.sender] = WithdrawalRequest({
+            user:        msg.sender,
+            shares:      shares,
+            requestedAt: uint64(block.timestamp),
+            unlockAt:    unlockAt,
+            fulfilled:   false
+        });
+
+        emit WithdrawalQueued(msg.sender, shares, unlockAt);
+    }
+
+    function fulfillWithdraw() external nonReentrant {
+        WithdrawalRequest storage req = withdrawalRequests[msg.sender];
+
+        if (req.requestedAt == 0)              revert WithdrawalNotFound(msg.sender);
+        if (req.fulfilled)                     revert WithdrawalAlreadyFulfilled(msg.sender);
+        if (block.timestamp < req.unlockAt) {
+            revert WithdrawalNotReady(req.unlockAt, uint64(block.timestamp));
+        }
+
+        UserPosition storage pos = positions[msg.sender];
+        if (pos.state != LifecycleState.OPEN) revert PositionNotOpen(msg.sender);
+
+        IERC20 hype = IERC20(asset());
+
+        uint256 shares       = req.shares;
+        uint256 supplyBefore = totalSupply();
+        uint256 hypeBefore   = hype.balanceOf(address(this));
+
+        // Unwind both legs via PM
+        IPositionManagerMin(positionManager).closePerpLegFull(msg.sender);
+        IPositionManagerMin(positionManager).repayHyperLendFromCollateral(msg.sender);
+
+        uint256 hypeRecovered = hype.balanceOf(address(this)) - hypeBefore;
+        uint256 userPortion   = (hypeRecovered * shares) / supplyBefore;
+
+        // Drain user's reserves from YR — transfers to this contract
+        uint256 reserves = IYieldRouterMin(yieldRouter).drainUserReserves(msg.sender);
+
+        uint256 totalReturn = userPortion + reserves;
+
+        _burn(address(this), shares);
+
+        req.fulfilled  = true;
+        pos.state  = LifecycleState.CLOSED;
+        IYieldRouterMin(yieldRouter).unregisterUser(msg.sender);
+
+        if (totalReturn > 0) {
+            SafeERC20.safeTransfer(hype, msg.sender, totalReturn);
+        }
+
+        emit WithdrawalFulfilled(msg.sender, shares, totalReturn);
+    }
+
+    function cancelWithdraw() external nonReentrant {
+        WithdrawalRequest storage req = withdrawalRequests[msg.sender];
+        if (req.requestedAt == 0) revert WithdrawalNotFound(msg.sender);
+        if (req.fulfilled)        revert WithdrawalAlreadyFulfilled(msg.sender);
+
+        uint256 shares = req.shares;
+        delete withdrawalRequests[msg.sender];
+
+        _transfer(address(this), msg.sender, shares);
+
+        emit WithdrawalCancelled(msg.sender, shares);
+    }
+
     /* ─── Internal helpers ─── */
     function _addActiveUser(address user) internal {
         if (_activeUserIndex[user] == 0) {
@@ -595,52 +720,138 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         return positions[user].spotReserveBalance;
     }
 
+    function getUserRiskProfile(address user) external view returns (uint8) {
+        return uint8(positions[user].riskProfile);
+    }
+
+    function setVaultLevelState(VaultLevelState newState) external onlyRole(RISK_MANAGER_ROLE) {
+        VaultLevelState prev = vaultState.state;
+        vaultState.state = newState;
+        emit VaultStateChanged(prev, newState);
+    }
+
+    /// @notice Pause user-facing entry points. Existing positions remain operable.
+    function pause() external onlyRole(PAUSER_ROLE) {
+        _pause();
+    }
+
+    function unpause() external onlyRole(PAUSER_ROLE) {
+        _unpause();
+    }
+
+    /// @notice Toggle new deposits without pausing repay/withdraw paths.
+    function setDepositsEnabled(bool enabled) external onlyRole(PAUSER_ROLE) {
+        depositsEnabled = enabled;
+        emit DepositsEnabledChanged(enabled);
+    }
+
+    /// @notice YieldRouter calls this when funneling protocol's cut of funding income.
+    /// @dev    Stored in USDC. Caller should have already transferred USDC to the vault.
+    function accrueProtocolFees(uint256 amount) external onlyRole(YIELD_ROUTER_ROLE) {
+        accumulatedProtocolFees += amount;
+        emit ProtocolFeesAccrued(amount);
+    }
+
+    /// @notice Sweep accumulated USDC fees to the treasury holder.
+    function collectProtocolFees(address treasury) external onlyRole(TREASURY_ROLE) {
+        if (treasury == address(0)) revert TreasuryNotSet();
+        uint256 amount = accumulatedProtocolFees;
+        if (amount == 0) revert NoFeesToCollect();
+
+        accumulatedProtocolFees = 0;
+        usdc.safeTransfer(treasury, amount);
+        //IERC20(usdc()).safeTransfer(treasury, amount);
+
+        emit ProtocolFeesCollected(treasury, amount);
+    }
+
     /// @notice RiskManager-only forced unwind. Mirrors repay() but unilateral
-///         and sets state to FORCE_CLOSED.
-function forceClose(address user)
-    external
-    onlyRole(RISK_MANAGER_ROLE)
-    nonReentrant
-    {
-        UserPosition storage pos = positions[user];
-        if (pos.state != LifecycleState.OPEN && pos.state != LifecycleState.REPAYING) {
-            revert PositionNotOpen(user);
+    ///         and sets state to FORCE_CLOSED.
+    function forceClose(address user)
+        external
+        onlyRole(RISK_MANAGER_ROLE)
+        nonReentrant
+        {
+            UserPosition storage pos = positions[user];
+            if (pos.state != LifecycleState.OPEN && pos.state != LifecycleState.REPAYING) {
+                revert PositionNotOpen(user);
+            }
+
+            pos.state = LifecycleState.REPAYING;     // intermediate
+
+            uint256 totalDebtBefore = pos.hyperLendDebtUsd + pos.perpMarginWithdrawnUsd;
+            uint256 spotReserve     = pos.spotReserveBalance;
+            uint256 sharesToBurn    = balanceOf(user);
+
+            // Close perp + repay HyperLend; PM transfers HYPE back to vault
+            uint256 hypeFromPerp    = IPositionManagerMin(positionManager).closePerpLegFull(user);
+            IPositionManagerMin(positionManager).withdrawAllPerpMargin(user);
+            uint256 hypeFromLending = IPositionManagerMin(positionManager).repayHyperLendFromCollateral(user);
+
+            uint256 totalHype = hypeFromPerp + hypeFromLending + spotReserve;
+
+            if (sharesToBurn > 0) {
+                _burn(user, sharesToBurn);
+            }
+
+            vaultState.totalUsdcDebtOutstanding -= totalDebtBefore;
+
+            pos.hyperLendDebtUsd        = 0;
+            pos.perpMarginWithdrawnUsd  = 0;
+            pos.spotReserveBalance      = 0;
+            pos.smoothingReserveBalance = 0;
+            pos.creditBalance           = 0;
+            pos.state                   = LifecycleState.FORCE_CLOSED;
+
+            _removeActiveUser(user);
+
+            IYieldRouterMin(yieldRouter).unregisterUser(user);
+
+            if (totalHype > 0) {
+                IERC20(asset()).safeTransfer(user, totalHype);
+            }
+
+            emit PositionClosed(user, totalHype, sharesToBurn, LifecycleState.FORCE_CLOSED);
         }
 
-        pos.state = LifecycleState.REPAYING;     // intermediate
+    /// @notice Real NAV in HYPE. Sums each active user's position components.
+    /// @dev    Approximation: uses recorded position state + reserves. Doesn't include
+    ///         unrealized perp PnL beyond what's reflected in margin-withdrawn USD.
+    function totalAssets() public view override returns (uint256 totalHype) {
+        uint256 hypeUsd = IOracleLayerMin(oracle).hypePriceUsdc(); // USDC per HYPE, 1e6 scale
 
-        uint256 totalDebtBefore = pos.hyperLendDebtUsd + pos.perpMarginWithdrawnUsd;
-        uint256 spotReserve     = pos.spotReserveBalance;
-        uint256 sharesToBurn    = balanceOf(user);
+        uint256 n = activeUsers.length;
+        for (uint256 i = 0; i < n; i++) {
+            address user = activeUsers[i];
+            UserPosition storage pos = positions[user];
+            if (pos.state != LifecycleState.OPEN) continue;
 
-        // Close perp + repay HyperLend; PM transfers HYPE back to vault
-        uint256 hypeFromPerp    = IPositionManagerMin(positionManager).closePerpLegFull(user);
-        IPositionManagerMin(positionManager).withdrawAllPerpMargin(user);
-        uint256 hypeFromLending = IPositionManagerMin(positionManager).repayHyperLendFromCollateral(user);
+            // Lending-leg HYPE collateral: original HYPE less anything already paid down
+            // For V1 we treat the deposited HYPE minus the spot reserve as on-protocol collateral.
+            uint256 collateralHype = pos.hypeDeposit - pos.spotReserveBalance;
 
-        uint256 totalHype = hypeFromPerp + hypeFromLending + spotReserve;
+            // Subtract HYPE-equivalent of HyperLend debt (debt is USDC-denominated)
+            uint256 debtHype = (pos.hyperLendDebtUsd * 1e18) / hypeUsd;
 
-        if (sharesToBurn > 0) {
-            _burn(user, sharesToBurn);
+            // Add back perp margin (still vault's economic value, just routed through HC)
+            uint256 perpMarginHype = (pos.perpMarginWithdrawnUsd * 1e18) / hypeUsd;
+
+            // Spot reserve is held in HYPE
+            uint256 spotHype = pos.spotReserveBalance;
+
+            // Smoothing + credit are USDC; convert
+            uint256 smoothingCreditHype =
+                ((pos.smoothingReserveBalance + pos.creditBalance) * 1e18) / hypeUsd;
+
+            // Net contribution
+            if (collateralHype + perpMarginHype + spotHype + smoothingCreditHype > debtHype) {
+                totalHype += (collateralHype + perpMarginHype + spotHype + smoothingCreditHype) - debtHype;
+            }
+            // If underwater, contributes 0 (don't go negative)
         }
 
-        vaultState.totalUsdcDebtOutstanding -= totalDebtBefore;
-
-        pos.hyperLendDebtUsd        = 0;
-        pos.perpMarginWithdrawnUsd  = 0;
-        pos.spotReserveBalance      = 0;
-        pos.smoothingReserveBalance = 0;
-        pos.creditBalance           = 0;
-        pos.state                   = LifecycleState.FORCE_CLOSED;
-
-        _removeActiveUser(user);
-
-        IYieldRouterMin(yieldRouter).unregisterUser(user);
-
-        if (totalHype > 0) {
-            IERC20(asset()).safeTransfer(user, totalHype);
-        }
-
-        emit PositionClosed(user, totalHype, sharesToBurn, LifecycleState.FORCE_CLOSED);
+        // Add idle HYPE in vault not attributed to any active user (e.g. recovered but not paid out)
+        uint256 idle = IERC20(asset()).balanceOf(address(this));
+        totalHype += idle;
     }
 }

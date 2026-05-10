@@ -4,6 +4,10 @@ pragma solidity ^0.8.20;
 import { IERC20 }     from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 }  from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
+interface IOracleLayerMin {
+    function hypePriceUsdc() external view returns (uint256);
+}
+
 /// @title  PositionManager
 /// @notice Executes leg actions for Carry Vault: HyperLend supply/borrow,
 ///         HYPE↔USDC swaps, and HyperCore perp account flows. Tracks per-user
@@ -41,7 +45,7 @@ contract PositionManager {
     uint8   public constant PERP_SIDE_SHORT            = 2;
 
     /// @dev V1 stub price. Production reads from OracleLayer.
-    uint256 public constant STUB_HYPE_PRICE_USD = 40;
+    //uint256 public constant STUB_HYPE_PRICE_USD = 40;
 
     /* ─────────────────────────── Immutable refs ─────────────────────────── */
 
@@ -425,20 +429,26 @@ contract PositionManager {
         return perpLegs[user];
     }
 
+    function hypeToUsdc(uint256 hypeWei) external view returns (uint256) {
+        return _hypeToUsdc(hypeWei);
+    }
+
+    function usdcToHype(uint256 usdcAmount) external view returns (uint256) {
+        return _usdcToHype(usdcAmount);
+    }
+
     /* ─────────────────────────── Internal helpers ─────────────────────────── */
 
     /// @dev Convert HYPE wei → USDC units using stub price. Production reads OracleLayer.
-    function _hypeToUsdc(uint256 hypeAmount) internal pure returns (uint256) {
-        // hypeAmount has 18 decimals; STUB_HYPE_PRICE_USD is integer USD.
-        // result in USDC units (6 decimals): hypeAmount * price * 1e6 / 1e18
-        return (hypeAmount * STUB_HYPE_PRICE_USD) / 1e12;
+    function _hypeToUsdc(uint256 hypeWei) internal view returns (uint256) {
+        uint256 priceUsdc = IOracleLayerMin(oracleLayer).hypePriceUsdc();
+        return (hypeWei * priceUsdc) / 1e18;
     }
 
     /// @dev Convert USDC units → HYPE wei using stub price.
-    function _usdcToHype(uint256 usdcAmount) internal pure returns (uint256) {
-        // usdcAmount has 6 decimals; STUB_HYPE_PRICE_USD is integer USD.
-        // result in HYPE wei: usdcAmount * 1e18 / (price * 1e6) = usdcAmount * 1e12 / price
-        return (usdcAmount * 1e12) / STUB_HYPE_PRICE_USD;
+    function _usdcToHype(uint256 usdcAmount) internal view returns (uint256) {
+        uint256 priceUsdc = IOracleLayerMin(oracleLayer).hypePriceUsdc();
+        return (usdcAmount * 1e18) / priceUsdc;
     }
 
     function _computeEffectiveLeverageBps(uint256 notionalUsd, uint256 marginUsd)

@@ -2,9 +2,23 @@
 pragma solidity ^0.8.20;
 
 import { AccessControl } from "@openzeppelin/contracts/access/AccessControl.sol";
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+
 
 interface IPositionManagerMin {
     function getHyperLendDebt(address user) external view returns (uint256);
+    function hypeToUsdc(uint256 hypeWei) external view returns (uint256);
+    function usdcToHype(uint256 usdcAmount) external view returns (uint256);
+}
+
+interface IVaultCoreMin {
+    function updateSpotReserve(address user, uint256 newBalance)        external;
+    function updateSmoothingReserve(address user, uint256 newBalance)   external;
+    function updateCreditBalance(address user, uint256 newBalance)      external;
+    function updateHyperLendDebt(address user, uint256 newDebt)         external;
+    function asset() external view returns (address);
 }
 
 /// @title  YieldRouter
@@ -30,7 +44,9 @@ contract YieldRouter is AccessControl {
     uint16  public constant RISKY_RESERVE_BPS             = 500;
 
     /// @dev V1 stub price; production reads from OracleLayer.
-    uint256 public constant STUB_HYPE_PRICE_USD = 40;
+    //uint256 public constant STUB_HYPE_PRICE_USD = 40;
+
+    using SafeERC20 for IERC20;
 
     /* ─────────────────────────── Immutable refs ─────────────────────────── */
 
@@ -233,7 +249,7 @@ contract YieldRouter is AccessControl {
             smoothingReserves[user]  = 0;
             uncovered                = expenseUsd - covered;
         }
-
+        IVaultCoreMin(vaultCore).updateSmoothingReserve(user, smoothingReserves[user]);
         emit BorrowExpenseCovered(user, expenseUsd, covered, uncovered);
     }
 
@@ -255,6 +271,7 @@ contract YieldRouter is AccessControl {
         spotTopUpHype       = _usdcToHype(spotTopUpUsdc);
 
         spotReserves[user] += spotTopUpHype;
+        IVaultCoreMin(vaultCore).updateSpotReserve(user, spotReserves[user]);
 
         // (Real impl: positionManager.swapUsdcToHype(spotTopUpUsdc) and verify amounts.)
     }
@@ -273,6 +290,7 @@ contract YieldRouter is AccessControl {
         smoothingTopUp  = remainingUsd < deficit ? remainingUsd : deficit;
 
         smoothingReserves[user] += smoothingTopUp;
+        IVaultCoreMin(vaultCore).updateSmoothingReserve(user, smoothingReserves[user]);
     }
 
     function _applyPaydown(address user, uint256 currentDebt, uint256 remainingUsd)
@@ -294,6 +312,11 @@ contract YieldRouter is AccessControl {
         // (Real impl: callback to VaultCore.applyPaydown(user, paydown) so the
         //  hyperLendDebtUsd field shrinks. For V1 we accumulate locally and
         //  VaultCore syncs on a later step.)
+        uint256 newDebt = currentDebt - paydown;
+        IVaultCoreMin(vaultCore).updateHyperLendDebt(user, newDebt);
+        if (overage > 0) {
+            IVaultCoreMin(vaultCore).updateCreditBalance(user, creditBalances[user]);
+        }
     }
 
     /* ─────────────────────────── Targets (views) ─────────────────────────── */
@@ -333,13 +356,30 @@ contract YieldRouter is AccessControl {
         paydownAccumulatedUsd  = accumulatedPaydown[user];
     }
 
-    /* ─────────────────────────── Internal price math ─────────────────────────── */
-
-    function _hypeToUsdc(uint256 hypeWei) internal pure returns (uint256) {
-        return (hypeWei * STUB_HYPE_PRICE_USD) / 1e12;
+    // In YieldRouter.sol
+    function getUserSmoothingReserve(address user) external view returns (uint256) {
+        return smoothingReserves[user];
     }
 
-    function _usdcToHype(uint256 usdcAmount) internal pure returns (uint256) {
-        return (usdcAmount * 1e12) / STUB_HYPE_PRICE_USD;
+    function drainUserReserves(address user) external onlyVaultCore returns (uint256 totalHype) {
+        uint256 sm = smoothingReserves[user];
+        uint256 sp = spotReserves[user];
+        if (sm > 0) smoothingReserves[user] = 0;
+        if (sp > 0) spotReserves[user] = 0;
+        totalHype = sm + sp;
+        // YR holds these reserves as HYPE — transfer to vault for forwarding to user
+        if (totalHype > 0) {
+            IERC20(IVaultCoreMin(vaultCore).asset()).safeTransfer(msg.sender, totalHype);
+        }
+    }
+
+    /* ─────────────────────────── Internal price math ─────────────────────────── */
+
+    function _hypeToUsdc(uint256 hypeWei) internal view returns (uint256) {
+        return IPositionManagerMin(positionManager).hypeToUsdc(hypeWei);
+    }
+
+    function _usdcToHype(uint256 usdcAmount) internal view returns (uint256) {
+        return IPositionManagerMin(positionManager).usdcToHype(usdcAmount);
     }
 }
