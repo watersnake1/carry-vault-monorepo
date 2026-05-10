@@ -206,6 +206,7 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
     error InvalidVaultState(VaultLevelState current);
     error InsufficientShares(uint256 have, uint256 want);
     error WithdrawalAlreadyQueued(address user);
+    error PartialWithdrawalNotSupported(uint256 requested, uint256 available);
     error WithdrawalAlreadyFulfilled(address user);
     //error DepositsDisabled();
     error NoFeesToCollect();
@@ -503,13 +504,15 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         UserPosition storage pos = positions[msg.sender];
         if (pos.state != LifecycleState.OPEN) revert PositionNotOpen(msg.sender);
 
-        uint256 bal = balanceOf(msg.sender);
-        if (bal < shares) revert InsufficientShares(bal, shares);
-
         WithdrawalRequest storage existing = withdrawalRequests[msg.sender];
         if (existing.requestedAt != 0 && !existing.fulfilled) {
             revert WithdrawalAlreadyQueued(msg.sender);
         }
+
+        uint256 bal = balanceOf(msg.sender);
+        if (shares != bal) revert PartialWithdrawalNotSupported(shares, bal);
+
+        
 
         _transfer(msg.sender, address(this), shares);
 
@@ -537,32 +540,24 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         UserPosition storage pos = positions[msg.sender];
         if (pos.state != LifecycleState.OPEN) revert PositionNotOpen(msg.sender);
 
-        IERC20 hype = IERC20(asset());
+        uint256 shares = req.shares;
 
-        uint256 shares       = req.shares;
-        uint256 supplyBefore = totalSupply();
-        uint256 hypeBefore   = hype.balanceOf(address(this));
+        // Per-user recovery: each PM call returns exactly the HYPE attributable
+        // to this user's legs and transfers it here.
+        uint256 perpHype    = IPositionManagerMin(positionManager).closePerpLegFull(msg.sender);
+        uint256 lendingHype = IPositionManagerMin(positionManager).repayHyperLendFromCollateral(msg.sender);
+        uint256 reserves    = IYieldRouterMin(yieldRouter).drainUserReserves(msg.sender);
 
-        // Unwind both legs via PM
-        IPositionManagerMin(positionManager).closePerpLegFull(msg.sender);
-        IPositionManagerMin(positionManager).repayHyperLendFromCollateral(msg.sender);
-
-        uint256 hypeRecovered = hype.balanceOf(address(this)) - hypeBefore;
-        uint256 userPortion   = (hypeRecovered * shares) / supplyBefore;
-
-        // Drain user's reserves from YR — transfers to this contract
-        uint256 reserves = IYieldRouterMin(yieldRouter).drainUserReserves(msg.sender);
-
-        uint256 totalReturn = userPortion + reserves;
+        uint256 totalReturn = perpHype + lendingHype + reserves;
 
         _burn(address(this), shares);
 
-        req.fulfilled  = true;
-        pos.state  = LifecycleState.CLOSED;
+        req.fulfilled = true;
+        pos.state = LifecycleState.CLOSED;
         IYieldRouterMin(yieldRouter).unregisterUser(msg.sender);
 
         if (totalReturn > 0) {
-            SafeERC20.safeTransfer(hype, msg.sender, totalReturn);
+            IERC20(asset()).safeTransfer(msg.sender, totalReturn);
         }
 
         emit WithdrawalFulfilled(msg.sender, shares, totalReturn);
