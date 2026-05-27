@@ -936,4 +936,9 @@ contract VaultCore is ERC4626, AccessControl, Pausable, ReentrancyGuard {
         v.riskManager             = riskManager;
         v.yieldRouter             = yieldRouter;
     }
+
+    // get the timestamp of the last rebalance
+    function lastRebalanceAt() external view returns (uint64) {
+        return vaultState.lastRebalance;
+    }
 }
